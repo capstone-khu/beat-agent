@@ -35,6 +35,42 @@ from BeatNetPlus.inference import BeatNetPlusInference
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+def fill_missing_beats(
+        beat_times:    np.ndarray,
+        beat_interval: float,
+        max_gap_ratio: float = 1.6,   # 기대 간격의 1.6배 초과면 누락으로 판단
+    ) -> np.ndarray:
+        """
+        beat 간격이 beat_interval * max_gap_ratio 초과면
+        그 사이에 beat가 누락된 것으로 판단하고 보간으로 채운다.
+
+        예시 (beat_interval=631ms, max_gap=1009ms)
+        ────────────────────────────────────────
+        [3.72, 5.62]  간격 1900ms = 3박
+        → 보간: [3.72, 4.35, 4.98, 5.62]  (631ms 간격으로 2개 삽입)
+        """
+        threshold = beat_interval * max_gap_ratio
+        result    = [beat_times[0]]
+        inserted  = 0
+
+        for i in range(len(beat_times) - 1):
+            gap    = beat_times[i+1] - beat_times[i]
+            n_miss = round(gap / beat_interval) - 1   # 누락된 박 수
+
+            if gap > threshold and n_miss > 0:
+                # 등간격으로 보간
+                for k in range(1, n_miss + 1):
+                    interp_t = beat_times[i] + k * (gap / (n_miss + 1))
+                    result.append(interp_t)
+                    inserted += 1
+
+            result.append(beat_times[i+1])
+
+        result = np.array(sorted(result))
+        print(f"[보간] {inserted}개 삽입 "
+            f"({len(beat_times)}개 → {len(result)}개)  "
+            f"평균 간격: {np.diff(result).mean()*1000:.1f}ms")
+        return result
 
 def _set_korean_font():
     candidates = ["Malgun Gothic","AppleGothic","NanumGothic",
@@ -49,9 +85,9 @@ def _set_korean_font():
 
 _set_korean_font()
 
-BEATNET_WEIGHTS = "BeatNet-Plus/src/BeatNetPlus/models/af_non_percussive_weights.pt"
-TOLERANCE_MS    = 70
-STABLE_THRESH   = 0.25
+BEATNET_WEIGHTS   = "BeatNet-Plus/src/BeatNetPlus/models/af_non_percussive_weights.pt"
+TOLERANCE_MS      = 70
+SUBDIVISION_RATIO = 0.70
 
 
 def run_beatnet(audio_path: str) -> np.ndarray:
@@ -72,80 +108,70 @@ def build_beat_grid_from_midi(midi_path: str) -> np.ndarray:
     return beat_times
 
 
-# ══════════════════════════════════════════════════════════════
-#  초반 불안정 beat 제거 + align
-#
-#  문제
-#  ──────────────────────────────────────────────────────────
-#  BeatNet+ 초반 수렴 구간에서 subdivision beat가 섞여
-#  0.52, 0.84, 1.04, 1.48 ... 처럼 간격이 들쭉날쭉해짐.
-#  이 beat들을 align 계산에서만 빼는 게 아니라
-#  beat_times 배열 자체에서 제거해야 한다.
-#
-#  해결
-#  ──────────────────────────────────────────────────────────
-#  1. beat 간격이 기대값(BPM) ±25% 이내로 연속 2박 이상
-#     안정화되는 첫 인덱스를 탐지
-#  2. 그 이전 beat를 beat_times에서 완전히 제거
-#  3. 제거된 beat 시간대의 Beat Grid도 동일하게 제거
-#     (평가 공정성 유지)
-#  4. 남은 beat들로 DTW align 수행
-# ══════════════════════════════════════════════════════════════
-def trim_and_align(
-    beat_grid:     np.ndarray,
-    beat_times:    np.ndarray,
-    downbeat_times: np.ndarray,
-    audio_start:   float,
-    beat_interval: float,
-    threshold:     float = STABLE_THRESH,
+def remove_subdivision_beats(
+    beat_times, beat_grid, audio_start, beat_interval,
+    ratio=SUBDIVISION_RATIO,
+) -> np.ndarray:
+    """
+    beat 간격이 beat_interval * ratio 미만인 쌍에서
+    Beat Grid와 더 먼 beat를 제거. 전체 구간 적용.
+    """
+    threshold = beat_interval * ratio
+    ref       = beat_grid + audio_start
+    beats     = list(beat_times)
+    i, removed = 0, 0
+
+    while i < len(beats) - 1:
+        gap = beats[i+1] - beats[i]
+        if gap < threshold:
+            dist_i  = min(abs(ref - beats[i]))
+            dist_i1 = min(abs(ref - beats[i+1]))
+            if dist_i <= dist_i1:
+                beats.pop(i+1)
+            else:
+                beats.pop(i)
+            removed += 1
+        else:
+            i += 1
+
+    result = np.array(beats)
+    print(f"[Subdivision 제거] {removed}개 제거 "
+          f"({len(beat_times)}개 → {len(result)}개)  "
+          f"평균 간격: {np.diff(result).mean()*1000:.1f}ms")
+    return result
+
+
+def align_beat_grid_dtw(
+    beat_grid, beat_times, audio_start, beat_interval,
 ) -> tuple:
     """
-    초반 불안정 beat를 제거하고 Beat Grid를 정렬한다.
+    2단계 align:
+    1) Coarse: BeatNet+ 첫 beat 기준으로 정수박 단위 대략 보정
+    2) Fine:   DTW 1:1 매핑의 median offset으로 미세 보정
 
-    반환
-    ────
-    (aligned_audio_start,
-     trimmed_beat_times,
-     trimmed_downbeat_times,
-     trimmed_beat_grid)    ← 제거된 구간에 해당하는 grid도 함께 제거
+    Coarse 보정이 없으면 1박 어긋난 채로 DTW가 매핑되어
+    전체 오차가 ~750ms 일정하게 발생하는 문제를 방지한다.
     """
-    bt = beat_times[beat_times >= audio_start]
-    if len(bt) < 4:
-        return audio_start, bt, downbeat_times, beat_grid
+    bt  = beat_times
+    ref = beat_grid + audio_start
 
-    # 1. 안정화 시작 인덱스 탐지 (연속 2박 기준)
-    stable_idx = len(bt) - 1   # fallback: 전부 불안정
-    for i in range(len(bt) - 2):
-        g1 = bt[i+1] - bt[i]
-        g2 = bt[i+2] - bt[i+1]
-        if (abs(g1 - beat_interval) / beat_interval < threshold and
-            abs(g2 - beat_interval) / beat_interval < threshold):
-            stable_idx = i
-            break
+    if len(bt) < 2 or len(ref) < 2:
+        return audio_start, bt
 
-    stable_start_time = bt[stable_idx]
-    bt_stable = bt[stable_idx:]
+    # ── 1단계: Coarse align (정수박 단위) ──────────────────
+    beat_diff      = bt[0] - ref[0]
+    n_beats_offset = round(beat_diff / beat_interval)
+    coarse_offset  = n_beats_offset * beat_interval
+    ref_coarse     = ref + coarse_offset
+    audio_start_c  = audio_start + coarse_offset
 
-    print(f"[Trim] 불안정 구간 제거: beat 0~{stable_idx-1}개 "
-          f"({audio_start:.3f}s ~ {stable_start_time:.3f}s)")
-    print(f"[Trim] 안정 beat {len(bt_stable)}개 "
-          f"(첫 beat: {bt_stable[0]:.3f}s, 간격: "
-          f"{np.diff(bt_stable).mean()*1000:.1f}ms)")
+    print(f"[Align-Coarse] BeatNet+ 첫 beat: {bt[0]:.3f}s  "
+          f"Grid 첫 박: {ref[0]:.3f}s  "
+          f"차이: {beat_diff*1000:+.0f}ms → {n_beats_offset}박 보정")
 
-    # 2. downbeat도 stable_start_time 이후만 유지
-    db_stable = downbeat_times[downbeat_times >= stable_start_time]
-
-    # 3. Beat Grid도 stable_start_time 이후에 해당하는 부분만 유지
-    #    (평가 공정성: 검출된 beat 없는 구간은 평가에서 제외)
-    ref_full   = beat_grid + audio_start
-    grid_stable = beat_grid[ref_full >= stable_start_time]
-
-    # 4. DTW align (stable beat 전체 사용)
-    if len(grid_stable) < 2 or len(bt_stable) < 2:
-        return stable_start_time, bt_stable, db_stable, grid_stable
-
+    # ── 2단계: Fine align (DTW median) ─────────────────────
     D, wp = librosa.sequence.dtw(
-        C=cdist(grid_stable.reshape(-1, 1), bt_stable.reshape(-1, 1))
+        C=cdist(ref_coarse.reshape(-1,1), bt.reshape(-1,1))
     )
     wp = np.array(wp[::-1])
 
@@ -160,27 +186,29 @@ def trim_and_align(
         if len(q_indices) == 1:
             q_idx = q_indices[0]
             if len(seen_query[q_idx]) == 1:
-                diff = bt_stable[q_idx] - (grid_stable[r_idx] + audio_start)
+                diff = bt[q_idx] - ref_coarse[r_idx]
                 if abs(diff) < beat_interval:
                     offsets.append(diff)
 
     if not offsets:
-        print("[Align] 유효 매핑 없음 -> audio_start 유지")
-        return audio_start, bt_stable, db_stable, grid_stable
+        print("[Align-Fine] 유효 매핑 없음 -> coarse 보정만 적용")
+        return audio_start_c, bt
 
-    best_offset  = float(np.median(offsets))
-    new_start    = audio_start + best_offset
-    print(f"[Align] 1:1 매핑 {len(offsets)}개 -> "
-          f"median offset {best_offset*1000:+.1f}ms")
-    print(f"[Align] audio_start {audio_start:.3f}s -> {new_start:.3f}s")
-    print(f"[Align] 보정 후 Grid 첫 박: {grid_stable[0]+new_start:.3f}s  "
-          f"BeatNet+ 첫 beat: {bt_stable[0]:.3f}s")
-    return new_start, bt_stable, db_stable, grid_stable
+    fine_offset = float(np.median(offsets))
+    new_start   = audio_start_c + fine_offset
+
+    print(f"[Align-Fine] 1:1 매핑 {len(offsets)}개 -> "
+          f"fine offset {fine_offset*1000:+.1f}ms")
+    print(f"[Align] 최종: {audio_start:.3f}s -> {new_start:.3f}s  "
+          f"(coarse {coarse_offset*1000:+.0f}ms + "
+          f"fine {fine_offset*1000:+.1f}ms)")
+    print(f"[Align] 보정 후 Grid 첫 박: {beat_grid[0]+new_start:.3f}s  "
+          f"BeatNet+ 첫 beat: {bt[0]:.3f}s")
+    return new_start, bt
 
 
 def evaluate_beatnet_detection(
-    beat_grid: np.ndarray, beat_times: np.ndarray,
-    audio_start: float, tolerance_ms: float = TOLERANCE_MS,
+    beat_grid, beat_times, audio_start, tolerance_ms=TOLERANCE_MS,
 ) -> dict:
     tol       = tolerance_ms / 1000.0
     reference = beat_grid + audio_start
@@ -194,7 +222,7 @@ def evaluate_beatnet_detection(
             matched_ref.add(ri)
             matched_pred.add(pi)
 
-    n_matched = len(matched_ref)
+    n_matched     = len(matched_ref)
     n_ref, n_pred = len(reference), len(beat_times)
     precision = n_matched / n_pred if n_pred > 0 else 0.0
     recall    = n_matched / n_ref  if n_ref  > 0 else 0.0
@@ -202,7 +230,7 @@ def evaluate_beatnet_detection(
                  if (precision+recall) > 0 else 0.0)
 
     errors_ms = np.array([
-        (beat_times[pi] - reference[ri]) * 1000
+        (beat_times[pi]-reference[ri])*1000
         for ri, pi in zip(sorted(matched_ref), sorted(matched_pred))
     ])
 
@@ -244,11 +272,13 @@ class ViolinRhythmAgent:
     """
     바이올린 연주 박자 정확도 평가 에이전트 (실시간 전용).
 
-    초반 불안정 beat 처리 개선
+    처리 파이프라인
     ──────────────────────────────────────────────────────────
-    기존: warmup N박을 align 계산에서만 제외 → beat_times엔 남아있음
-    변경: 불안정 beat를 beat_times 자체에서 완전히 제거
-          해당 구간 Beat Grid도 함께 제거 (평가 공정성)
+    BeatNet+ 원본
+      → subdivision 제거 (전체 구간, Beat Grid 기준)
+      → Coarse align (정수박 단위, 1박 어긋남 방지)
+      → Fine align (DTW median)
+      → 평가
     """
 
     def __init__(self, midi_path: str, chunk_duration: float = 3.0):
@@ -311,7 +341,6 @@ class ViolinRhythmAgent:
         wp     = np.array(wp[::-1])
         signed = [float(beat_times[j]-grid_onsets[i]) for i,j in wp]
         errors = [abs(e) for e in signed]
-        # beat 간격 대비 상대 오차로 정규화
         rel    = [e / self.beat_interval for e in errors]
         raw    = float(np.exp(-np.mean(rel) * 3))
         score  = raw if self._prev_timing is None \
@@ -336,8 +365,7 @@ class ViolinRhythmAgent:
     def process(self, audio_path: str) -> tuple:
         """
         반환: (json_results, aligned_audio_start,
-               trimmed_beat_times, trimmed_downbeat_times,
-               trimmed_beat_grid)
+               clean_beat_times, downbeat_times, beat_grid)
         """
         print("[BeatNet+] beat 추적 중...")
         raw            = run_beatnet(audio_path)
@@ -354,16 +382,27 @@ class ViolinRhythmAgent:
         beat_times     = beat_times[beat_times >= audio_start]
         downbeat_times = downbeat_times[downbeat_times >= audio_start]
 
-        # 초반 불안정 beat 제거 + align
-        audio_start, beat_times, downbeat_times, beat_grid_trimmed = \
-            trim_and_align(
-                beat_grid      = self.beat_grid,
-                beat_times     = beat_times,
-                downbeat_times = downbeat_times,
-                audio_start    = audio_start,
-                beat_interval  = self.beat_interval,
-            )
-        shifted_grid = beat_grid_trimmed + audio_start
+        # 1. subdivision 제거
+        beat_times = remove_subdivision_beats(
+            beat_times    = beat_times,
+            beat_grid     = self.beat_grid,
+            audio_start   = audio_start,
+            beat_interval = self.beat_interval,
+        )
+
+        beat_times = fill_missing_beats(
+            beat_times    = beat_times,
+            beat_interval = self.beat_interval,
+        )
+
+        # 2. Coarse + Fine align
+        audio_start, beat_times = align_beat_grid_dtw(
+            beat_grid     = self.beat_grid,
+            beat_times    = beat_times,
+            audio_start   = audio_start,
+            beat_interval = self.beat_interval,
+        )
+        shifted_grid = self.beat_grid + audio_start
 
         total_chunks = max(1, int(
             (beat_times[-1] - audio_start) / self.chunk_duration))
@@ -405,7 +444,7 @@ class ViolinRhythmAgent:
             })
 
         return (json.dumps(results, ensure_ascii=False, indent=2),
-                audio_start, beat_times, downbeat_times, beat_grid_trimmed)
+                audio_start, beat_times, downbeat_times, self.beat_grid)
 
 
 def evaluate_performance(json_results: str) -> dict:
@@ -425,7 +464,6 @@ def evaluate_performance(json_results: str) -> dict:
         "recommendation":    recommend,
         "weaknesses":        ["박자 안정성 부족"] if timing_avg < 0.60 else [],
     }
-
 
 def plot_beat_comparison(
     beat_grid, beat_times, downbeat_times=None,
@@ -459,13 +497,13 @@ def plot_beat_comparison(
     x_max = max(shifted_grid[-1], beat_times[-1]) + 0.2
 
     ax1 = axes[0]
-    ax1.set_title("beat 위치 타임라인 (불안정 구간 제거 후)", fontsize=11, pad=6)
+    ax1.set_title("beat 위치 타임라인 (coarse+fine align)", fontsize=11, pad=6)
     ax1.vlines(shifted_grid, 0.6, 1.4, color=colors["grid"],
-               linewidth=1.5, alpha=0.8, label="Beat Grid (안정 구간)")
+               linewidth=1.5, alpha=0.8, label="Beat Grid")
     ax1.scatter(shifted_grid, np.ones(len(shifted_grid)),
                 color=colors["grid"], s=40, zorder=3)
     ax1.vlines(beat_times, -0.4, 0.4, color=colors["beat"],
-               linewidth=1.5, alpha=0.8, label="BeatNet+ (안정 구간)")
+               linewidth=1.5, alpha=0.8, label="BeatNet+")
     ax1.scatter(beat_times, np.zeros(len(beat_times)),
                 color=colors["beat"], s=40, zorder=3)
     if downbeat_times is not None and len(downbeat_times) > 0:
@@ -520,7 +558,7 @@ def plot_beat_comparison(
             patch.set_facecolor(colors["error_pos"] if left>=0
                                 else colors["error_neg"])
             patch.set_alpha(0.8)
-        ax3.axvline(0,            color="black",          linewidth=1.0)
+        ax3.axvline(0,             color="black",          linewidth=1.0)
         ax3.axvline( TOLERANCE_MS, color=colors["error_pos"],
                     linewidth=0.9, linestyle="--", alpha=0.7)
         ax3.axvline(-TOLERANCE_MS, color=colors["error_neg"],
@@ -545,7 +583,7 @@ def plot_beat_comparison(
 
     if detection_stats and n_rows == 4:
         ax4 = axes[3]
-        ax4.set_title("BeatNet+ 검출 정확도 (불안정 구간 제거 후)",
+        ax4.set_title("BeatNet+ 검출 정확도 (coarse+fine align)",
                       fontsize=11, pad=6)
         ax4.axis("off")
         metrics = [
@@ -587,23 +625,25 @@ def plot_beat_comparison(
 
 if __name__ == "__main__":
     MIDI_PATH  = "twinkle.mid"
-    AUDIO_PATH = "performance2.mp4"
+    AUDIO_PATH = "performance.mp4"
 
     agent = ViolinRhythmAgent(MIDI_PATH, chunk_duration=3.0)
 
     res, aligned_audio_start, beat_times_final, \
-        downbeat_times_final, beat_grid_trimmed = agent.process(AUDIO_PATH)
+        downbeat_times_final, beat_grid_final = agent.process(AUDIO_PATH)
+    
+    
 
-    print(f"\n[진단] 불안정 구간 제거 후 첫 5개 비교:")
-    print(f"  Beat Grid (trimmed): "
-          f"{np.round(beat_grid_trimmed[:5] + aligned_audio_start, 3)}")
-    print(f"  BeatNet+  (trimmed): {np.round(beat_times_final[:5], 3)}")
+    print(f"\n[진단] 정렬 후 첫 5개 비교:")
+    print(f"  Beat Grid: "
+          f"{np.round(beat_grid_final[:5] + aligned_audio_start, 3)}")
+    print(f"  BeatNet+ : {np.round(beat_times_final[:5], 3)}")
     print(f"  첫 beat 차이: "
-          f"{(beat_times_final[0]-(beat_grid_trimmed[0]+aligned_audio_start))*1000:.1f}ms")
+          f"{(beat_times_final[0]-(beat_grid_final[0]+aligned_audio_start))*1000:.1f}ms")
     print(f"  마지막 beat: {beat_times_final[-1]:.3f}s")
 
     detection_stats = evaluate_beatnet_detection(
-        beat_grid    = beat_grid_trimmed,
+        beat_grid    = beat_grid_final,
         beat_times   = beat_times_final,
         audio_start  = aligned_audio_start,
         tolerance_ms = TOLERANCE_MS,
@@ -614,10 +654,10 @@ if __name__ == "__main__":
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
     plot_beat_comparison(
-        beat_grid       = beat_grid_trimmed,
+        beat_grid       = beat_grid_final,
         beat_times      = beat_times_final,
         downbeat_times  = downbeat_times_final,
         audio_start     = aligned_audio_start,
         detection_stats = detection_stats,
-        title           = "twinkle - Beat Grid vs BeatNet+ (불안정 구간 제거)",
+        title           = "Beat Grid vs BeatNet+ (coarse+fine align)",
     )
