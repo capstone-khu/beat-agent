@@ -29,6 +29,7 @@ import pretty_midi
 from scipy.spatial.distance import cdist
 import subprocess, os, warnings, json
 import matplotlib
+matplotlib.use('Agg')  # 화면 출력 없이 파일로만 저장 (interactive 경고 제거)
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import madmom
@@ -220,7 +221,7 @@ class ViolinRhythmAgent:
       3. 타이밍 점수 산출
     """
 
-    def __init__(self, midi_path: str, chunk_duration: float = 3.0):
+    def __init__(self, midi_path: str, chunk_duration: float = 1.0):
         self.chunk_duration = chunk_duration
         self.midi_path      = midi_path
         self._prev_timing   = None
@@ -272,7 +273,16 @@ class ViolinRhythmAgent:
 
     def _score_timing(self, grid_onsets, beat_times):
         if len(grid_onsets) < 2 or len(beat_times) < 2:
-            return 0.0, []
+            # beat가 1개인 chunk: 점수는 이전 유지, drift는 1:1 차이로 계산
+            prev = self._prev_timing if self._prev_timing is not None else 0.0
+            if len(grid_onsets) >= 1 and len(beat_times) >= 1:
+                # 가장 가까운 grid beat와의 차이를 signed로 반환
+                diffs  = np.abs(grid_onsets - beat_times[0])
+                ri     = int(np.argmin(diffs))
+                signed = [float(beat_times[0] - grid_onsets[ri])]
+            else:
+                signed = []
+            return prev, signed
         D, wp  = librosa.sequence.dtw(
             C=cdist(grid_onsets.reshape(-1,1), beat_times.reshape(-1,1)))
         wp     = np.array(wp[::-1])
@@ -287,17 +297,17 @@ class ViolinRhythmAgent:
 
     @staticmethod
     def _timing_label(s):
-        if s >= 0.80: return "정확"
-        if s >= 0.55: return "보통"
-        return "불안정"
+        if s >= 0.80: return "ACCURATE"
+        if s >= 0.55: return "MODERATE"
+        return "UNSTABLE"
 
     @staticmethod
     def _drift_label(signed):
-        if not signed: return "측정불가"
+        if not signed: return "UNKNOWN"
         ms = float(np.mean(signed)) * 1000
-        if   ms >  80: return f"늦게 연주 +{ms:.0f}ms"
-        elif ms < -80: return f"빠르게 연주 {ms:.0f}ms"
-        else:          return f"박자 정확 ({ms:+.0f}ms)"
+        if   ms >  80: return f"LATE +{ms:.0f}ms"
+        elif ms < -80: return f"EARLY {ms:.0f}ms"
+        else:          return f"ON_TIME ({ms:+.0f}ms)"
 
     def process(self, audio_path: str) -> tuple:
         wav_path = self._to_wav(audio_path)
@@ -320,6 +330,7 @@ class ViolinRhythmAgent:
         )
 
         # 2. MIDI BPM으로 리샘플 (누적 tempo 오차 제거)
+        raw_beat_times = beat_times.copy()  # 원본 madmom beat 보존 (drift 계산용)
         beat_times = resample_to_midi_bpm(
             beat_times    = beat_times,
             beat_grid     = self.beat_grid,
@@ -331,45 +342,51 @@ class ViolinRhythmAgent:
         total_chunks = max(1, int(
             (beat_times[-1] - audio_start) / self.chunk_duration))
         results      = []
-        print("\n===== 바이올린 박자 평가 시작 =====")
+        print("\n===== 바이올린 박자 평가 시작 =====\n")
 
         for i in range(total_chunks):
             t_start = audio_start + i * self.chunk_duration
             t_end   = audio_start + (i+1) * self.chunk_duration
-            grid_seg  = shifted_grid[
+            grid_seg     = shifted_grid[
                 (shifted_grid >= t_start) & (shifted_grid < t_end)]
-            beats_seg = beat_times[
+            beats_seg    = beat_times[
                 (beat_times  >= t_start) & (beat_times  < t_end)]
+            raw_beats_seg = raw_beat_times[
+                (raw_beat_times >= t_start) & (raw_beat_times < t_end)]
 
-            print(f"\n[{t_start:.1f}s ~ {t_end:.1f}s]  "
-                  f"Beat Grid: {len(grid_seg)}박  madmom: {len(beats_seg)}beat")
-
-            timing_score, signed = self._score_timing(grid_seg, beats_seg)
+            # score: 리샘플된 beat (정확도 측정)
+            # drift: 원본 madmom beat (실제 연주 위치 반영)
+            timing_score, _ = self._score_timing(grid_seg, beats_seg)
+            _, signed        = self._score_timing(grid_seg, raw_beats_seg)
             t_label = self._timing_label(timing_score)
             d_label = self._drift_label(signed)
-            print(f"  타이밍: {timing_score:.3f}  {t_label}")
-            print(f"  밀림:   {d_label}")
 
-            results.append({
-                "start_time":       round(t_start, 2),
-                "end_time":         round(t_end, 2),
-                "grid_count":       int(len(grid_seg)),
-                "beat_count":       int(len(beats_seg)),
-                "timing_score":     round(timing_score, 3),
-                "timing_label":     t_label,
-                "drift_label":      d_label,
-                "signed_errors_ms": [round(e*1000,1) for e in signed],
-            })
+            chunk_result = {
+                "start_time":  round(t_start, 2),
+                "end_time":    round(t_end, 2),
+                "onset_count": int(len(grid_seg)),
+                "beat_count":  int(len(beats_seg)),
+                "score":       round(timing_score, 2),
+                "tempo_label": t_label,
+                "drift_label": d_label if d_label != "UNKNOWN" else "UNKNOWN",
+            }
+            print(json.dumps(chunk_result, ensure_ascii=False) + ",")
+
+            results.append(chunk_result)
 
         return (json.dumps(results, ensure_ascii=False, indent=2),
-                audio_start, beat_times, self.beat_grid)
+                audio_start, beat_times, self.beat_grid, raw_beat_times)
 
 
 def evaluate_performance(json_results: str) -> dict:
     data = json.loads(json_results)
     if not data:
         return {"error": "결과 없음"}
-    timing_avg = float(np.mean([c["timing_score"] for c in data]))
+    # onset_count < 2인 chunk는 평가 불가(beat 부족)로 제외
+    valid = [c for c in data if c.get("onset_count", 2) >= 2]
+    if not valid:
+        valid = data  # 전부 제외되면 전체 사용
+    timing_avg = float(np.mean([c.get("timing_score", c.get("score", 0.0)) for c in valid]))
     if timing_avg >= 0.80:
         level, recommend = "훌륭", "더 어려운 곡 도전 추천"
     elif timing_avg >= 0.60:
@@ -528,7 +545,6 @@ def plot_beat_comparison(
     plt.tight_layout(rect=[0, 0, 1, 0.98])
     out_path = "beat_comparison.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.show()
     print(f"[시각화] {out_path} 저장 완료")
 
 
@@ -536,8 +552,8 @@ if __name__ == "__main__":
     MIDI_PATH  = "twinkle.mid"
     AUDIO_PATH = "performance2.mp4"
 
-    agent = ViolinRhythmAgent(MIDI_PATH, chunk_duration=3.0)
-    res, aligned_audio_start, beat_times_final, beat_grid_final = \
+    agent = ViolinRhythmAgent(MIDI_PATH, chunk_duration=1.0)
+    res, aligned_audio_start, beat_times_final, beat_grid_final, raw_beat_times_final = \
         agent.process(AUDIO_PATH)
 
     # 첫 10개 비교
