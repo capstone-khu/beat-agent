@@ -548,9 +548,229 @@ def plot_beat_comparison(
     print(f"[시각화] {out_path} 저장 완료")
 
 
+# ══════════════════════════════════════════════════════════════
+#  박자 State 판별
+#  이미지 정의 기준
+#  ──────────────────────────────────────────────────────────
+#  R-S0 GOOD  : drift ±80ms 이내 + score >= 0.80
+#  R-S1 EARLY : drift < -80ms  (박자보다 일찍 연주)
+#  R-S2 LATE  : drift > +80ms  (박자보다 늦게 연주)
+#  R-S3 FAST  : score < 0.55 + 평균 간격이 기대보다 짧음 (빠른 템포)
+#  R-S4 SLOW  : score < 0.55 + 평균 간격이 기대보다 길거나 beat 누락
+# ══════════════════════════════════════════════════════════════
+def get_rhythm_state(chunk: dict, beat_interval_ms: float) -> str:
+    """
+    chunk 결과 하나에서 박자 State를 판별한다.
+
+    파라미터
+    ────────
+    chunk          : process() 반환 JSON의 개별 항목
+    beat_interval_ms: MIDI BPM 기준 한 박 길이 (ms)
+
+    반환: "GOOD" | "EARLY" | "LATE" | "FAST" | "SLOW"
+    """
+    score       = chunk.get("score", 0.0)
+    drift_label = chunk.get("drift_label", "UNKNOWN")
+    onset_count = chunk.get("onset_count", 0)
+    beat_count  = chunk.get("beat_count", 0)
+
+    # drift ms 추출 (예: "LATE +150ms" → 150, "EARLY -80ms" → -80)
+    drift_ms = 0.0
+    if "LATE" in drift_label:
+        try:
+            drift_ms = float(drift_label.split("+")[-1].replace("ms)", "").replace("ms", ""))
+        except ValueError:
+            drift_ms = 100.0
+    elif "EARLY" in drift_label:
+        try:
+            drift_ms = -abs(float(drift_label.split("-")[-1].replace("ms)", "").replace("ms", "")))
+        except ValueError:
+            drift_ms = -100.0
+
+    # beat 과다/부족으로 템포 판별
+    # onset_count: 기대 beat 수, beat_count: 실제 검출 수
+    if onset_count > 0:
+        beat_ratio = beat_count / onset_count
+    else:
+        beat_ratio = 1.0
+
+    if score >= 0.80 and abs(drift_ms) <= 80:
+        return "GOOD"
+    elif drift_ms < -80:
+        return "EARLY"
+    elif drift_ms > 80:
+        return "LATE"
+    elif beat_ratio > 1.3:   # beat가 기대보다 30% 이상 많음 → 빠른 템포
+        return "FAST"
+    else:                     # score 낮고 EARLY/LATE도 아닌 경우 → 느린 템포 or 불안정
+        return "SLOW"
+
+
+# ══════════════════════════════════════════════════════════════
+#  큐테이블 조회 및 액션 선택
+#  (큐테이블은 공유 모듈에서 가져온다고 가정 — 아직 미구현)
+# ══════════════════════════════════════════════════════════════
+def lookup_action(q_table: dict, prev_state: str, curr_state: str) -> str:
+    """
+    공유 큐테이블에서 (prev_state, curr_state) 행을 조회해
+    최적 액션을 반환한다.
+
+    큐테이블 구조 (예시)
+    ────────────────────
+    {
+      ("EARLY", "EARLY"): "RHYTHM_WAIT",
+      ("EARLY", "GOOD"):  "POSITIVE_RHYTHM",
+      ("LATE",  "LATE"):  "RHYTHM_CATCH_UP",
+      ...
+    }
+
+    파라미터
+    ────────
+    q_table    : 공유 큐테이블 dict  (key: (prev_state, curr_state))
+    prev_state : 이전 chunk state
+    curr_state : 현재 chunk state
+
+    반환: 액션명 문자열
+    """
+    key    = (prev_state, curr_state)
+    action = q_table.get(key)
+
+    if action is None:
+        # 큐테이블에 해당 전환이 없으면 state별 기본 액션 사용
+        default_actions = {
+            "GOOD":  "POSITIVE_RHYTHM",
+            "EARLY": "RHYTHM_WAIT",
+            "LATE":  "RHYTHM_CATCH_UP",
+            "FAST":  "TEMPO_SLOW_DOWN",
+            "SLOW":  "TEMPO_SPEED_UP",
+        }
+        action = default_actions.get(curr_state, "POSITIVE_RHYTHM")
+        print(f"[Q-Table] ({prev_state}→{curr_state}) 미정의 → 기본 액션: {action}")
+    else:
+        print(f"[Q-Table] ({prev_state}→{curr_state}) → 액션: {action}")
+
+    return action
+
+
+# ══════════════════════════════════════════════════════════════
+#  슈퍼바이저 전달
+#  (슈퍼바이저는 공유 모듈에서 가져온다고 가정 — 아직 미구현)
+# ══════════════════════════════════════════════════════════════
+def report_to_supervisor(
+    supervisor,          # 슈퍼바이저 객체 (미구현 시 None)
+    agent_id:   str,
+    action:     str,
+    curr_state: str,
+    reward:     float,
+    fail_count: int,
+) -> dict:
+    """
+    슈퍼바이저에 현재 상태/점수/실패 카운트를 전달한다.
+
+    파라미터
+    ────────
+    supervisor : 슈퍼바이저 객체 (None이면 로컬 출력만)
+    agent_id   : 에이전트 식별자 (예: "rhythm_agent")
+    action     : 선택된 액션명
+    curr_state : 현재 박자 state
+    reward     : 이번 chunk 리워드 (+1.0 or -1.0)
+    fail_count : 연속 실패 횟수
+
+    반환: 전달 페이로드 dict
+    """
+    payload = {
+        "agent_id":   agent_id,
+        "action":     action,
+        "state":      curr_state,
+        "reward":     reward,
+        "fail_count": fail_count,
+    }
+
+    if supervisor is not None:
+        # 슈퍼바이저 구현 시 아래 형태로 호출
+        # supervisor.receive(payload)
+        pass
+
+    print(f"[Supervisor] {json.dumps(payload, ensure_ascii=False)}")
+    return payload
+
+
+# ══════════════════════════════════════════════════════════════
+#  박자 에이전트 메인 루프
+#  큐테이블 조회 → 액션 선택 → 슈퍼바이저 보고
+# ══════════════════════════════════════════════════════════════
+def run_rhythm_agent(
+    json_results:     str,
+    beat_interval_ms: float,
+    q_table:          dict,
+    supervisor        = None,
+    agent_id:         str   = "rhythm_agent",
+    fail_threshold:   int   = 3,
+) -> list:
+    """
+    process() 결과 JSON을 받아 chunk별로
+    State 판별 → 큐테이블 조회 → 슈퍼바이저 보고를 수행한다.
+
+    파라미터
+    ────────
+    json_results     : agent.process()가 반환한 JSON 문자열
+    beat_interval_ms : MIDI BPM 기준 한 박 길이 (ms)
+    q_table          : 공유 큐테이블 dict
+    supervisor       : 슈퍼바이저 객체 (None이면 로컬 출력)
+    agent_id         : 에이전트 식별자
+    fail_threshold   : 연속 실패 N회 이상 시 SWITCH_RHYTHM_TO_POSTURE
+
+    반환: chunk별 보고 결과 리스트
+    """
+    data       = json.loads(json_results)
+    reports    = []
+    prev_state = "GOOD"   # 초기 이전 state
+    fail_count = 0
+
+    print("===== 박자 에이전트 루프 시작 =====")
+
+    for chunk in data:
+        curr_state = get_rhythm_state(chunk, beat_interval_ms)
+
+        # 큐테이블 조회 → 액션 선택
+        action = lookup_action(q_table, prev_state, curr_state)
+
+        # SA-11: 연속 실패 3회 이상
+        if curr_state != "GOOD" and fail_count >= fail_threshold:
+            action = "SWITCH_RHYTHM_TO_POSTURE"
+            print(f"[Agent] 연속 실패 {fail_count}회 → {action}")
+
+        # 리워드 계산
+        # GOOD 전환 시: +1.0 / 미전환 시: -1.0
+        if curr_state == "GOOD":
+            reward     = 1.0
+            fail_count = 0
+        else:
+            reward      = -1.0
+            fail_count += 1
+
+        # 슈퍼바이저 보고
+        report = report_to_supervisor(
+            supervisor = supervisor,
+            agent_id   = agent_id,
+            action     = action,
+            curr_state = curr_state,
+            reward     = reward,
+            fail_count = fail_count,
+        )
+        report["chunk_start"] = chunk["start_time"]
+        report["chunk_end"]   = chunk["end_time"]
+        reports.append(report)
+
+        prev_state = curr_state
+
+    print("===== 박자 에이전트 루프 종료 =====\n")
+    return reports
+
+
 if __name__ == "__main__":
     MIDI_PATH  = "twinkle.mid"
-    AUDIO_PATH = "performance2.mp4"
+    AUDIO_PATH = "performance.mp4"
 
     agent = ViolinRhythmAgent(MIDI_PATH, chunk_duration=1.0)
     res, aligned_audio_start, beat_times_final, beat_grid_final, raw_beat_times_final = \
@@ -586,3 +806,23 @@ if __name__ == "__main__":
         detection_stats = detection_stats,
         title           = "twinkle - Beat Grid vs madmom (BPM 리샘플)",
     )
+
+    # ── 큐테이블 조회 + 슈퍼바이저 보고 ─────────────────────────
+    # 큐테이블: 공유 모듈 연결 전까지 빈 dict 사용 (기본 액션으로 동작)
+    # 실제 연결 시: from shared.q_table import Q_TABLE 등으로 교체
+    Q_TABLE = {}   # 공유 큐테이블 (미구현 — 연결 시 교체)
+    SUPERVISOR = None  # 슈퍼바이저 객체 (미구현 — 연결 시 교체)
+
+    reports = run_rhythm_agent(
+        json_results     = res,
+        beat_interval_ms = agent.beat_interval * 1000,
+        q_table          = Q_TABLE,
+        supervisor       = SUPERVISOR,
+        agent_id         = "rhythm_agent",
+        fail_threshold   = 3,
+    )
+
+    print("\n=== 에이전트 보고 요약 ===")
+    good_count = sum(1 for r in reports if r["state"] == "GOOD")
+    print(f"  총 chunk: {len(reports)}개  GOOD: {good_count}개  "
+          f"비율: {good_count/len(reports)*100:.1f}%")
