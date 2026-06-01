@@ -396,7 +396,7 @@ def report_to_supervisor(
     reward:      float | None,
     q_value:     float,
     measure:     int,
-    fail_count:  int,
+    fail_count:  int | None = None,   # 미사용 (하위 호환 유지용)
     meta:        dict | None = None,
 ) -> dict:
     """
@@ -407,15 +407,20 @@ def report_to_supervisor(
     ─────────────────────────────────────────────────────
     {
       "agent":     "rhythm",
-      "measure":   12,              # 마디 번호 (1-based)
-      "state":     "LATE",          # 현재 State enum
-      "action_id": "SA-07",         # 선택한 액션 ID
+      "measure":   3,
+      "state":     "LATE",
+      "action_id": "SA-07",
       "action":    "RHYTHM_CATCH_UP",
       "feedback":  "박자보다 늦게 ...",
-      "reward":    -0.3,            # 직전 액션 대비 평가 (첫 번째는 null)
-      "q":         0.0700,          # 갱신 후 Q[state][action]
-      "meta": {                     # 도메인 고유 정보 (선택)
-        "fail_count": 1
+      "reward":    -0.3,          # 직전 액션 대비 평가 (첫 번째는 null)
+      "q":         0.0700,        # 갱신 후 Q[state][action]
+      "meta": {
+        "index":       4,         # 0-based chunk 순번
+        "half":        1,         # 1=전반, 2=후반
+        "start_time":  2.532,
+        "end_time":    3.165,
+        "score":       0.61,
+        "drift_label": "LATE +92ms"
       }
     }
     """
@@ -465,14 +470,28 @@ class ViolinRhythmAgent:
       5. Reward 산출 → Q테이블 업데이트 → 슈퍼바이저 보고
     """
 
-    def __init__(self, midi_path: str, chunk_duration: float = 1.0):
-        self.chunk_duration = chunk_duration
-        self.midi_path      = midi_path
-        self._prev_timing   = None
+    def __init__(self, midi_path: str,
+                 beats_per_measure: int = 4,
+                 call_supervisor_q_threshold: float = -0.3):
+        """
+        파라미터
+        ────────
+        midi_path                   : MIDI 파일 경로
+        beats_per_measure           : 박자 수 / 마디 (기본 4 → 4/4박자)
+        call_supervisor_q_threshold : 이 값 이하의 Q값이면 CALL_SUPERVISOR 선택
+                                      (fail_count 대신 Q값으로 위임 판단)
+        """
+        self.midi_path               = midi_path
+        self.beats_per_measure       = beats_per_measure
+        self.beats_per_half_measure  = beats_per_measure // 2   # 반 마디 = 2박
+        self.call_supervisor_q_threshold = call_supervisor_q_threshold
+        self._prev_timing            = None
 
         midi               = pretty_midi.PrettyMIDI(midi_path)
         self.bpm           = midi.get_tempo_changes()[1][0]
         self.beat_interval = 60.0 / self.bpm
+        # 반 마디 길이 (초)
+        self.half_measure_duration = self.beat_interval * self.beats_per_half_measure
         self.midi_notes    = self._load_midi_notes(midi_path)
         self.beat_grid     = build_beat_grid_from_midi(midi_path)
 
@@ -482,7 +501,10 @@ class ViolinRhythmAgent:
         print(f"[Beat Grid] 첫 박: {self.beat_grid[0]:.3f}s  "
               f"마지막 박: {self.beat_grid[-1]:.3f}s  "
               f"BPM: {self.bpm:.1f}  간격: {self.beat_interval*1000:.0f}ms")
-        print(f"[Q-Table] 초기화 완료 — States: {STATES}, Actions: {ACTIONS}")
+        print(f"[반 마디]   {self.beats_per_half_measure}박 "
+              f"= {self.half_measure_duration*1000:.0f}ms")
+        print(f"[Q-Table]  초기화 완료 — States: {STATES}, Actions: {ACTIONS}")
+        print(f"[Supervisor 위임] Q값 ≤ {self.call_supervisor_q_threshold} 시 CALL_SUPERVISOR")
 
     def _load_midi_notes(self, midi_path):
         midi      = pretty_midi.PrettyMIDI(midi_path)
@@ -522,26 +544,60 @@ class ViolinRhythmAgent:
         return t
 
     def _score_timing(self, grid_onsets, beat_times):
-        if len(grid_onsets) < 2 or len(beat_times) < 2:
+        """
+        타이밍 점수 산출 (detrended nearest-match 방식).
+        반환: (smoothed_score, raw_score, signed_errors)
+
+        ── 설계 원칙 ──────────────────────────────────────────────
+        · raw_beat_times(원본 madmom) 기준으로 점수 계산
+        · 단, BPM 차이로 인한 누적 드리프트(tempo drift)는 제거
+          → 구간 내 평균 오차(drift_avg)를 빼고 잔차만 평가
+          → '박자 간격의 일관성'이 아닌 '박자 내 위치 정확도' 측정
+        · 드리프트 자체는 drift_label로 별도 전달
+
+        ── 처리 흐름 ──────────────────────────────────────────────
+        1. 각 grid beat에 nearest raw beat 1:1 매핑
+        2. signed_errors 계산
+        3. mean_drift(평균 오차) 제거 → residuals
+        4. residuals 기준으로 exp 점수 산출
+        5. EMA smoothing (0.5/0.5)
+        """
+        if len(grid_onsets) == 0 or len(beat_times) == 0:
             prev = self._prev_timing if self._prev_timing is not None else 0.0
-            if len(grid_onsets) >= 1 and len(beat_times) >= 1:
-                diffs  = np.abs(grid_onsets - beat_times[0])
-                ri     = int(np.argmin(diffs))
-                signed = [float(beat_times[0] - grid_onsets[ri])]
-            else:
-                signed = []
-            return prev, signed
-        D, wp  = librosa.sequence.dtw(
-            C=cdist(grid_onsets.reshape(-1,1), beat_times.reshape(-1,1)))
-        wp     = np.array(wp[::-1])
-        signed = [float(beat_times[j]-grid_onsets[i]) for i,j in wp]
-        errors = [abs(e) for e in signed]
-        rel    = [e / self.beat_interval for e in errors]
-        raw    = float(np.exp(-np.mean(rel) * 3))
-        score  = raw if self._prev_timing is None \
-                 else 0.7*self._prev_timing + 0.3*raw
-        self._prev_timing = score
-        return score, signed
+            return prev, 0.0, []
+
+        # 1:1 nearest 매핑
+        signed = []
+        for g in grid_onsets:
+            diffs = np.abs(beat_times - g)
+            ri    = int(np.argmin(diffs))
+            signed.append(float(beat_times[ri] - g))
+
+        # 구간 평균 드리프트 제거 → 잔차
+        mean_drift = float(np.mean(signed))
+        residuals  = [s - mean_drift for s in signed]
+        rel        = [abs(r) / self.beat_interval for r in residuals]
+        raw        = float(np.exp(-np.mean(rel) * 3))
+
+        smoothed = raw if self._prev_timing is None \
+                   else 0.5 * self._prev_timing + 0.5 * raw
+        self._prev_timing = smoothed
+        return smoothed, raw, signed
+
+    def _drift_signed(self, grid_onsets, raw_beat_times):
+        """
+        원본 madmom beat 기준 drift 계산 (EMA 없음, _prev_timing 불변).
+        detrend 없이 실제 절대 오차를 반환 → drift_label 산출용.
+        반환: signed_errors list[float] (단위: 초)
+        """
+        if len(grid_onsets) == 0 or len(raw_beat_times) == 0:
+            return []
+        signed = []
+        for g in grid_onsets:
+            diffs = np.abs(raw_beat_times - g)
+            ri    = int(np.argmin(diffs))
+            signed.append(float(raw_beat_times[ri] - g))
+        return signed
 
     @staticmethod
     def _timing_label(s):
@@ -585,14 +641,28 @@ class ViolinRhythmAgent:
         )
 
         shifted_grid = self.beat_grid + audio_start
-        total_chunks = max(1, int(
-            (beat_times[-1] - audio_start) / self.chunk_duration))
-        results      = []
-        print("\n===== 바이올린 박자 평가 시작 =====\n")
+
+        # ── 반 마디 단위 chunk 경계 생성 ────────────────────────
+        # beat_grid는 beat 단위이므로 beats_per_half_measure 간격으로 슬라이싱
+        # 예: 4/4박자 → 2박마다 하나의 chunk
+        half = self.beats_per_half_measure
+        # beat_grid 인덱스 기준 반 마디 시작점들
+        half_measure_starts = self.beat_grid[::half] + audio_start
+        total_chunks = len(half_measure_starts)
+
+        results = []
+        print("\n===== 바이올린 박자 평가 시작 (반 마디 단위) =====\n")
 
         for i in range(total_chunks):
-            t_start = audio_start + i * self.chunk_duration
-            t_end   = audio_start + (i+1) * self.chunk_duration
+            t_start = half_measure_starts[i]
+            t_end   = (half_measure_starts[i + 1]
+                       if i + 1 < total_chunks
+                       else beat_times[-1] + self.beat_interval)
+
+            # 이 chunk가 몇 번째 마디의 전반(1)/후반(2)인지
+            measure_number = i // 2 + 1          # 1-based 마디 번호
+            half_in_measure = i % 2 + 1          # 1 = 전반, 2 = 후반
+
             grid_seg      = shifted_grid[
                 (shifted_grid >= t_start) & (shifted_grid < t_end)]
             beats_seg     = beat_times[
@@ -600,17 +670,26 @@ class ViolinRhythmAgent:
             raw_beats_seg = raw_beat_times[
                 (raw_beat_times >= t_start) & (raw_beat_times < t_end)]
 
-            timing_score, _ = self._score_timing(grid_seg, beats_seg)
-            _, signed        = self._score_timing(grid_seg, raw_beats_seg)
+            # ── 점수: raw_beats vs grid (detrended) ───────────────
+            # · raw_beats = 원본 madmom beat (실제 연주 위치)
+            # · _score_timing 내부에서 BPM 드리프트(tempo offset)를 제거하고
+            #   박자 내 위치 정확도(잔차)만 평가
+            # · drift_label은 _drift_signed로 절대 오차 기준 산출
+            timing_score, raw_score, _ = self._score_timing(grid_seg, raw_beats_seg)
+            signed  = self._drift_signed(grid_seg, raw_beats_seg)
             t_label = self._timing_label(timing_score)
             d_label = self._drift_label(signed)
 
             chunk_result = {
-                "start_time":  round(t_start, 2),
-                "end_time":    round(t_end, 2),
+                "index":       i,
+                "measure":     measure_number,
+                "half":        half_in_measure,
+                "start_time":  round(t_start, 3),
+                "end_time":    round(t_end,   3),
                 "onset_count": int(len(grid_seg)),
-                "beat_count":  int(len(beats_seg)),
-                "score":       round(timing_score, 2),
+                "beat_count":  int(len(raw_beats_seg)),  # 원본 madmom 검출 수
+                "score":       round(timing_score, 3),
+                "raw_score":   round(raw_score,    3),
                 "tempo_label": t_label,
                 "drift_label": d_label if d_label != "UNKNOWN" else "UNKNOWN",
             }
@@ -623,57 +702,61 @@ class ViolinRhythmAgent:
     # ── Q-learning 기반 에이전트 루프 ──────────────────────────
     def run_agent(
         self,
-        json_results:   str,
-        supervisor      = None,
-        agent_id:       str = "rhythm_agent",
-        fail_threshold: int = 3,
+        json_results: str,
+        supervisor    = None,
+        agent_id:     str = "rhythm_agent",
     ) -> list:
         """
-        process() 결과를 받아 chunk별로
+        process() 결과를 받아 반 마디 chunk별로
         State 판별 → Q테이블 조회 → 액션 선택 →
         Reward 산출 → Q테이블 업데이트 → 슈퍼바이저 보고.
 
+        CALL_SUPERVISOR 발동 조건
+        ─────────────────────────
+        fail_count 대신 Q값으로 판단.
+        현재 State에서 best_action의 Q값이
+        call_supervisor_q_threshold 이하이면 CALL_SUPERVISOR 선택.
+        (학습 초기엔 Q값이 0.0이므로 룰베이스 기본 액션을 따르고,
+         반복 실패로 Q값이 하락하면 자동으로 위임)
+
         파라미터
         ────────
-        json_results   : agent.process()가 반환한 JSON 문자열
-        supervisor     : 슈퍼바이저 객체 (None이면 로컬 출력)
-        agent_id       : 에이전트 식별자 (로그용)
-        fail_threshold : 연속 실패 N회 이상 시 CALL_SUPERVISOR 강제 선택
+        json_results : agent.process()가 반환한 JSON 문자열
+        supervisor   : 슈퍼바이저 객체 (None이면 로컬 출력)
+        agent_id     : 에이전트 식별자 (로그용)
 
         반환: chunk별 보고 결과 리스트
         """
         data             = json.loads(json_results)
         reports          = []
-        prev_state       = "GOOD"    # 초기 이전 State
-        prev_action      = None      # 직전 액션 (첫 번째 reward는 null)
-        fail_count       = 0
+        prev_state       = "GOOD"
+        prev_action      = None      # 첫 번째 reward는 null
         beat_interval_ms = self.beat_interval * 1000
 
-        # 마디 계산을 위한 박자 수 / 마디 (MIDI 기준, 기본 4/4박자)
-        beats_per_measure = 4
-
-        print("===== 박자 에이전트 루프 시작 (Q-learning) =====")
+        print("===== 박자 에이전트 루프 시작 (Q-learning, 반 마디 단위) =====")
 
         for idx, chunk in enumerate(data):
             curr_state = get_rhythm_state(chunk, beat_interval_ms)
 
-            # ── 마디 번호 계산 ─────────────────────────────────
-            # chunk 시작 시간 기준으로 몇 번째 beat인지 추정 후 마디 환산
-            # beat_grid[0] 기준 상대 beat 인덱스 → // beats_per_measure + 1
-            t_start       = chunk["start_time"]
-            beat_idx      = int((t_start - self.beat_grid[0]) / self.beat_interval)
-            measure_number = beat_idx // beats_per_measure + 1
+            # chunk에 이미 index / measure / half 가 포함되어 있음 (process()에서 생성)
+            chunk_index     = chunk["index"]
+            measure_number  = chunk["measure"]
+            half_in_measure = chunk["half"]
 
-            # ── 1. Q테이블 조회 → 액션 선택 ──────────────────
-            action = self.q_table.best_action(curr_state)
+            # ── 1. Q테이블 조회 → best_action 및 Q값 확인 ────
+            best_act  = self.q_table.best_action(curr_state)
+            best_q    = self.q_table.get(curr_state, best_act)
 
-            # SA-11: 연속 실패 fail_threshold회 이상이면 강제 CALL_SUPERVISOR
-            if curr_state != "GOOD" and fail_count >= fail_threshold:
+            # Q값이 임계값 이하이면 CALL_SUPERVISOR (학습된 실패 패턴)
+            if curr_state != "GOOD" and best_q <= self.call_supervisor_q_threshold:
                 action = "CALL_SUPERVISOR"
-                print(f"[Agent] 연속 실패 {fail_count}회 → CALL_SUPERVISOR 강제 선택")
+                print(f"[Agent] Q[{curr_state}][{best_act}]={best_q:.4f} "
+                      f"≤ {self.call_supervisor_q_threshold} → CALL_SUPERVISOR")
+            else:
+                action = best_act
 
             # ── 2. Reward 산출 ────────────────────────────────
-            # 첫 번째 chunk는 직전 액션이 없으므로 reward = None
+            # 첫 번째 chunk는 직전 액션 없음 → None (JSON null)
             if prev_action is None:
                 reward = None
             else:
@@ -687,37 +770,34 @@ class ViolinRhythmAgent:
 
             # ── 4. Q테이블 업데이트 ───────────────────────────
             # Q(S,A) ← Q(S,A) + α[R + γ·maxQ(S',A') - Q(S,A)]
-            # reward가 None(첫 번째)이면 0.0으로 대체해 업데이트
+            # 첫 번째(reward=None)는 0.0으로 대체해 업데이트
             q_new = self.q_table.update(
                 state      = curr_state,
                 action     = action,
                 reward     = reward if reward is not None else 0.0,
                 next_state = next_state,
             )
-            print(f"[Q-Update] ({curr_state}, {action}) "
+            print(f"[Q-Update] chunk#{chunk_index:02d} "
+                  f"마디{measure_number}-{'전' if half_in_measure==1 else '후'}반  "
+                  f"({curr_state}, {action})  "
                   f"R={reward}  Q←{q_new:+.4f}")
-
-            # fail_count 갱신
-            if curr_state == "GOOD":
-                fail_count = 0
-            else:
-                fail_count += 1
 
             # ── 5. 슈퍼바이저 보고 ───────────────────────────
             report = report_to_supervisor(
                 supervisor = supervisor,
                 action     = action,
                 curr_state = curr_state,
-                reward     = reward,          # 첫 번째는 None → JSON null
+                reward     = reward,
                 q_value    = q_new,
                 measure    = measure_number,
-                fail_count = fail_count,
+                fail_count = None,          # fail_count 미사용
                 meta       = {
-                    "fail_count":   fail_count,
-                    "chunk_start":  chunk["start_time"],
-                    "chunk_end":    chunk["end_time"],
-                    "score":        chunk.get("score"),
-                    "drift_label":  chunk.get("drift_label"),
+                    "index":       chunk_index,
+                    "half":        half_in_measure,   # 1=전반, 2=후반
+                    "start_time":  chunk["start_time"],
+                    "end_time":    chunk["end_time"],
+                    "score":       chunk.get("score"),
+                    "drift_label": chunk.get("drift_label"),
                 },
             )
             reports.append(report)
@@ -904,12 +984,12 @@ def plot_beat_comparison(
 # ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     MIDI_PATH  = "twinkle.mid"
-    AUDIO_PATH = "performance.mp4"
+    AUDIO_PATH = "reference.mp3"
 
-    agent = ViolinRhythmAgent(MIDI_PATH, chunk_duration=1.0)
+    agent = ViolinRhythmAgent(MIDI_PATH)
     res, aligned_audio_start, beat_times_final, beat_grid_final, raw_beat_times_final = \
         agent.process(AUDIO_PATH)
-
+    
     # 첫 10개 비교
     shifted = beat_grid_final + aligned_audio_start
     print("\n[진단] Beat Grid vs madmom 첫 10개:")
@@ -946,10 +1026,8 @@ if __name__ == "__main__":
     SUPERVISOR = None   # 슈퍼바이저 객체 (미구현 — 연결 시 교체)
 
     reports = agent.run_agent(
-        json_results   = res,
-        supervisor     = SUPERVISOR,
-        agent_id       = "rhythm_agent",
-        fail_threshold = 3,
+        json_results = res,
+        supervisor   = SUPERVISOR,
     )
 
     print("\n=== 에이전트 보고 요약 ===")
