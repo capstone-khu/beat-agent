@@ -457,6 +457,11 @@ class ViolinRhythmAgent:
     초기에는 학습 데이터가 없으므로 룰베이스 기본 피드백을 사용.
     피드백 후 Reward를 산출해 Q테이블을 갱신하고 슈퍼바이저에 전달.
 
+    ── CALL_SUPERVISOR 선택 방식 ──
+    threshold 강제 override 없이 Q값 경쟁으로만 선택됨.
+    반복 실패로 Q[state][CALL_SUPERVISOR]가 타 액션보다 높아지면
+    best_action()이 자연스럽게 CALL_SUPERVISOR를 반환.
+
     ── Q-learning 업데이트 ──
     Q(S,A) ← Q(S,A) + α[R + γ·maxQ(S',A') - Q(S,A)]
     α=0.1, γ=0.9
@@ -471,20 +476,16 @@ class ViolinRhythmAgent:
     """
 
     def __init__(self, midi_path: str,
-                 beats_per_measure: int = 4,
-                 call_supervisor_q_threshold: float = -0.3):
+                 beats_per_measure: int = 4):
         """
         파라미터
         ────────
-        midi_path                   : MIDI 파일 경로
-        beats_per_measure           : 박자 수 / 마디 (기본 4 → 4/4박자)
-        call_supervisor_q_threshold : 이 값 이하의 Q값이면 CALL_SUPERVISOR 선택
-                                      (fail_count 대신 Q값으로 위임 판단)
+        midi_path         : MIDI 파일 경로
+        beats_per_measure : 박자 수 / 마디 (기본 4 → 4/4박자)
         """
         self.midi_path               = midi_path
         self.beats_per_measure       = beats_per_measure
         self.beats_per_half_measure  = beats_per_measure // 2   # 반 마디 = 2박
-        self.call_supervisor_q_threshold = call_supervisor_q_threshold
         self._prev_timing            = None
 
         midi               = pretty_midi.PrettyMIDI(midi_path)
@@ -504,7 +505,7 @@ class ViolinRhythmAgent:
         print(f"[반 마디]   {self.beats_per_half_measure}박 "
               f"= {self.half_measure_duration*1000:.0f}ms")
         print(f"[Q-Table]  초기화 완료 — States: {STATES}, Actions: {ACTIONS}")
-        print(f"[Supervisor 위임] Q값 ≤ {self.call_supervisor_q_threshold} 시 CALL_SUPERVISOR")
+        print(f"[Supervisor 위임] CALL_SUPERVISOR Q값이 타 액션보다 높을 때 자동 선택")
 
     def _load_midi_notes(self, midi_path):
         midi      = pretty_midi.PrettyMIDI(midi_path)
@@ -713,11 +714,9 @@ class ViolinRhythmAgent:
 
         CALL_SUPERVISOR 발동 조건
         ─────────────────────────
-        fail_count 대신 Q값으로 판단.
-        현재 State에서 best_action의 Q값이
-        call_supervisor_q_threshold 이하이면 CALL_SUPERVISOR 선택.
-        (학습 초기엔 Q값이 0.0이므로 룰베이스 기본 액션을 따르고,
-         반복 실패로 Q값이 하락하면 자동으로 위임)
+        threshold 강제 override 없이 순수 Q값 경쟁으로 선택.
+        반복 실패로 Q[state][CALL_SUPERVISOR]가 다른 액션의 Q값보다
+        높아지는 시점에 best_action()이 자연스럽게 CALL_SUPERVISOR를 반환.
 
         파라미터
         ────────
@@ -743,17 +742,12 @@ class ViolinRhythmAgent:
             measure_number  = chunk["measure"]
             half_in_measure = chunk["half"]
 
-            # ── 1. Q테이블 조회 → best_action 및 Q값 확인 ────
-            best_act  = self.q_table.best_action(curr_state)
-            best_q    = self.q_table.get(curr_state, best_act)
-
-            # Q값이 임계값 이하이면 CALL_SUPERVISOR (학습된 실패 패턴)
-            if curr_state != "GOOD" and best_q <= self.call_supervisor_q_threshold:
-                action = "CALL_SUPERVISOR"
-                print(f"[Agent] Q[{curr_state}][{best_act}]={best_q:.4f} "
-                      f"≤ {self.call_supervisor_q_threshold} → CALL_SUPERVISOR")
-            else:
-                action = best_act
+            # ── 1. Q테이블 조회 → best_action 선택 ──────────────
+            # CALL_SUPERVISOR 포함 모든 액션이 Q값 경쟁으로 선택됨
+            action   = self.q_table.best_action(curr_state)
+            action_q = self.q_table.get(curr_state, action)
+            print(f"[Agent] chunk#{chunk["index"]:02d}  state={curr_state}  "
+                  f"→ action={action}  Q={action_q:+.4f}")
 
             # ── 2. Reward 산출 ────────────────────────────────
             # 첫 번째 chunk는 직전 액션 없음 → None (JSON null)
