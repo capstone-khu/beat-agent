@@ -263,6 +263,84 @@ def build_beat_grid_from_midi(midi_path: str) -> np.ndarray:
     return beat_times
 
 
+def build_chunks_from_score_metadata(metadata_path: str) -> list:
+    """
+    score_metadata JSON 기준으로 반 마디 chunk 경계를 생성한다.
+
+    반환: list of dict
+      {
+        "measure":    int,   # 1-based 마디 번호
+        "half":       int,   # 1=전반, 2=후반
+        "start":      float, # chunk 시작 시간 (초)
+        "end":        float, # chunk 종료 시간 (초)
+        "note_count": int,   # chunk 내 MIDI 노트 수
+        "notes":      list,  # chunk 내 노트 정보 리스트
+      }
+    """
+    with open(metadata_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    notes    = data["notes"]
+    bpm_meta = data.get("bpm", None)
+
+    # BPM: metadata에 있으면 사용, 없으면 평균 음표 길이로 추정
+    if bpm_meta:
+        beat_interval = 60.0 / bpm_meta
+    else:
+        # 평균 음표 duration으로 beat_interval 추정 (4분음표 기준)
+        durations = [n["duration"] for n in notes]
+        beat_interval = float(np.median(durations))
+
+    half_dur = beat_interval * 2   # 반 마디 = 2박
+
+    # 마디별 노트 묶기
+    from collections import defaultdict
+    measure_notes: dict = defaultdict(list)
+    for n in notes:
+        measure_notes[n["measure"]].append(n)
+
+    sorted_measures = sorted(measure_notes.keys())
+    chunks = []
+
+    for i, m in enumerate(sorted_measures):
+        ns       = sorted(measure_notes[m], key=lambda x: x["start"])
+        m_start  = ns[0]["start"]
+        m_half   = m_start + half_dur
+
+        # 마디 끝 = 다음 마디 첫 노트 start, 마지막 마디는 마지막 음표 end
+        if i + 1 < len(sorted_measures):
+            next_m   = sorted_measures[i + 1]
+            next_ns  = sorted(measure_notes[next_m], key=lambda x: x["start"])
+            m_end    = next_ns[0]["start"]
+        else:
+            m_end = ns[-1]["end"]
+
+        front_notes = [n for n in ns if n["start"] <  m_half]
+        back_notes  = [n for n in ns if n["start"] >= m_half]
+
+        chunks.append({
+            "measure":    m,
+            "half":       1,
+            "start":      round(m_start, 3),
+            "end":        round(m_half,  3),
+            "note_count": len(front_notes),
+            "notes":      front_notes,
+        })
+        chunks.append({
+            "measure":    m,
+            "half":       2,
+            "start":      round(m_half, 3),
+            "end":        round(m_end,  3),
+            "note_count": len(back_notes),
+            "notes":      back_notes,
+        })
+
+    print(f"[Score Metadata] {metadata_path} 로드 완료")
+    print(f"  마디 수: {len(sorted_measures)}  →  chunk 수: {len(chunks)}")
+    print(f"  반마디 길이: {half_dur*1000:.0f}ms  (beat_interval={beat_interval*1000:.0f}ms)")
+    return chunks
+
+
 def align_to_grid(beat_grid, beat_times, audio_start, beat_interval) -> tuple:
     ref        = beat_grid + audio_start
     first_beat = beat_times[0]
@@ -476,17 +554,20 @@ class ViolinRhythmAgent:
     """
 
     def __init__(self, midi_path: str,
-                 beats_per_measure: int = 4):
+                 beats_per_measure: int = 4,
+                 score_metadata_path: str | None = None):
         """
         파라미터
         ────────
-        midi_path         : MIDI 파일 경로
-        beats_per_measure : 박자 수 / 마디 (기본 4 → 4/4박자)
+        midi_path            : MIDI 파일 경로
+        beats_per_measure    : 박자 수 / 마디 (기본 4 → 4/4박자)
+        score_metadata_path  : score_metadata JSON 경로 (지정 시 마디 기준으로 chunk 생성)
         """
         self.midi_path               = midi_path
         self.beats_per_measure       = beats_per_measure
         self.beats_per_half_measure  = beats_per_measure // 2   # 반 마디 = 2박
         self._prev_timing            = None
+        self.score_metadata_path     = score_metadata_path
 
         midi               = pretty_midi.PrettyMIDI(midi_path)
         self.bpm           = midi.get_tempo_changes()[1][0]
@@ -496,6 +577,12 @@ class ViolinRhythmAgent:
         self.midi_notes    = self._load_midi_notes(midi_path)
         self.beat_grid     = build_beat_grid_from_midi(midi_path)
 
+        # ── score_metadata 기반 chunk 경계 (지정된 경우) ──
+        if score_metadata_path:
+            self.score_chunks = build_chunks_from_score_metadata(score_metadata_path)
+        else:
+            self.score_chunks = None
+
         # ── 에이전트 개별 Q테이블 ──
         self.q_table = RhythmQTable(STATES, ACTIONS, alpha=ALPHA, gamma=GAMMA)
 
@@ -504,6 +591,7 @@ class ViolinRhythmAgent:
               f"BPM: {self.bpm:.1f}  간격: {self.beat_interval*1000:.0f}ms")
         print(f"[반 마디]   {self.beats_per_half_measure}박 "
               f"= {self.half_measure_duration*1000:.0f}ms")
+        print(f"[Chunk 기준] {'score_metadata JSON' if score_metadata_path else 'beat_grid (MIDI)'}")
         print(f"[Q-Table]  초기화 완료 — States: {STATES}, Actions: {ACTIONS}")
         print(f"[Supervisor 위임] CALL_SUPERVISOR Q값이 타 액션보다 높을 때 자동 선택")
 
@@ -644,25 +732,34 @@ class ViolinRhythmAgent:
         shifted_grid = self.beat_grid + audio_start
 
         # ── 반 마디 단위 chunk 경계 생성 ────────────────────────
-        # beat_grid는 beat 단위이므로 beats_per_half_measure 간격으로 슬라이싱
-        # 예: 4/4박자 → 2박마다 하나의 chunk
-        half = self.beats_per_half_measure
-        # beat_grid 인덱스 기준 반 마디 시작점들
-        half_measure_starts = self.beat_grid[::half] + audio_start
-        total_chunks = len(half_measure_starts)
+        # score_metadata JSON이 있으면 그 마디 기준 사용,
+        # 없으면 beat_grid 기반 기존 방식 사용
+        if self.score_chunks is not None:
+            chunk_defs = self.score_chunks   # list of {measure, half, start, end, ...}
+        else:
+            half = self.beats_per_half_measure
+            half_measure_starts = self.beat_grid[::half] + audio_start
+            chunk_defs = []
+            for i, ts in enumerate(half_measure_starts):
+                te = (half_measure_starts[i + 1]
+                      if i + 1 < len(half_measure_starts)
+                      else beat_times[-1] + self.beat_interval)
+                chunk_defs.append({
+                    "measure": i // 2 + 1,
+                    "half":    i % 2 + 1,
+                    "start":   float(ts),
+                    "end":     float(te),
+                })
 
+        total_chunks = len(chunk_defs)
         results = []
         print("\n===== 바이올린 박자 평가 시작 (반 마디 단위) =====\n")
 
-        for i in range(total_chunks):
-            t_start = half_measure_starts[i]
-            t_end   = (half_measure_starts[i + 1]
-                       if i + 1 < total_chunks
-                       else beat_times[-1] + self.beat_interval)
-
-            # 이 chunk가 몇 번째 마디의 전반(1)/후반(2)인지
-            measure_number = i // 2 + 1          # 1-based 마디 번호
-            half_in_measure = i % 2 + 1          # 1 = 전반, 2 = 후반
+        for i, cdef in enumerate(chunk_defs):
+            t_start         = cdef["start"]
+            t_end           = cdef["end"]
+            measure_number  = cdef["measure"]
+            half_in_measure = cdef["half"]
 
             grid_seg      = shifted_grid[
                 (shifted_grid >= t_start) & (shifted_grid < t_end)]
@@ -681,12 +778,16 @@ class ViolinRhythmAgent:
             t_label = self._timing_label(timing_score)
             d_label = self._drift_label(signed)
 
+            # score_metadata 기반일 때 note_count도 포함
+            note_count = cdef.get("note_count", len(grid_seg))
+
             chunk_result = {
                 "index":       i,
                 "measure":     measure_number,
                 "half":        half_in_measure,
                 "start_time":  round(t_start, 3),
                 "end_time":    round(t_end,   3),
+                "note_count":  note_count,
                 "onset_count": int(len(grid_seg)),
                 "beat_count":  int(len(raw_beats_seg)),  # 원본 madmom 검출 수
                 "score":       round(timing_score, 3),
@@ -977,10 +1078,11 @@ def plot_beat_comparison(
 #  메인
 # ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    MIDI_PATH  = "twinkle.mid"
-    AUDIO_PATH = "reference.mp3"
+    MIDI_PATH            = "twinkle2.mid"
+    AUDIO_PATH           = "reference.mp3"
+    SCORE_METADATA_PATH  = "score_metadata.json"   # None으로 바꾸면 beat_grid 방식으로 fallback
 
-    agent = ViolinRhythmAgent(MIDI_PATH)
+    agent = ViolinRhythmAgent(MIDI_PATH, score_metadata_path=SCORE_METADATA_PATH)
     res, aligned_audio_start, beat_times_final, beat_grid_final, raw_beat_times_final = \
         agent.process(AUDIO_PATH)
     
