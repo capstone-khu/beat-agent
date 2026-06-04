@@ -474,7 +474,6 @@ def report_to_supervisor(
     reward:      float | None,
     q_value:     float,
     measure:     int,
-    fail_count:  int | None = None,   # 미사용 (하위 호환 유지용)
     meta:        dict | None = None,
 ) -> dict:
     """
@@ -489,7 +488,7 @@ def report_to_supervisor(
       "state":     "LATE",
       "action_id": "SA-07",
       "action":    "RHYTHM_CATCH_UP",
-      "feedback":  "박자보다 늦게 ...",
+      "feedback":  "박자보다 늦게 연주하고 있습니다. 박자를 맞추세요",
       "reward":    -0.3,          # 직전 액션 대비 평가 (첫 번째는 null)
       "q":         0.0700,        # 갱신 후 Q[state][action]
       "meta": {
@@ -497,8 +496,15 @@ def report_to_supervisor(
         "half":        1,         # 1=전반, 2=후반
         "start_time":  2.532,
         "end_time":    3.165,
-        "score":       0.61,
-        "drift_label": "LATE +92ms"
+        "note_count":  4,         # chunk 내 MIDI 노트 수
+        "onset_count": 4,         # grid beat 수 (박자 격자)
+        "beat_count":  5,         # madmom 검출 beat 수
+        "score":       0.61,      # detrended 타이밍 점수 (EMA)
+        "raw_score":   0.58,      # detrended 타이밍 점수 (비평활)
+        "tempo_label": "MODERATE",
+        "drift_label": "LATE +92ms",
+        "drift_ms":    92.0,      # 평균 드리프트 (ms, + 늦음 / - 빠름)
+        "beat_ratio":  1.25,      # beat_count / onset_count
       }
     }
     """
@@ -843,6 +849,26 @@ class ViolinRhythmAgent:
             measure_number  = chunk["measure"]
             half_in_measure = chunk["half"]
 
+            # ── state 도출에 사용된 메타값 계산 ─────────────────
+            onset_count = chunk.get("onset_count", 0)
+            beat_count  = chunk.get("beat_count",  0)
+            beat_ratio  = round(beat_count / onset_count, 3) if onset_count > 0 else None
+
+            drift_label = chunk.get("drift_label", "UNKNOWN")
+            drift_ms: float | None = None
+            if "LATE" in drift_label:
+                try:
+                    drift_ms = float(drift_label.split("+")[-1].replace("ms)", "").replace("ms", ""))
+                except ValueError:
+                    drift_ms = None
+            elif "EARLY" in drift_label:
+                try:
+                    drift_ms = -abs(float(drift_label.split("-")[-1].replace("ms)", "").replace("ms", "")))
+                except ValueError:
+                    drift_ms = None
+            else:
+                drift_ms = 0.0   # ON_TIME
+
             # ── 1. Q테이블 조회 → best_action 선택 ──────────────
             # CALL_SUPERVISOR 포함 모든 액션이 Q값 경쟁으로 선택됨
             action   = self.q_table.best_action(curr_state)
@@ -885,14 +911,20 @@ class ViolinRhythmAgent:
                 reward     = reward,
                 q_value    = q_new,
                 measure    = measure_number,
-                fail_count = None,          # fail_count 미사용
                 meta       = {
                     "index":       chunk_index,
                     "half":        half_in_measure,   # 1=전반, 2=후반
                     "start_time":  chunk["start_time"],
                     "end_time":    chunk["end_time"],
+                    "note_count":  chunk.get("note_count"),
+                    "onset_count": onset_count,
+                    "beat_count":  beat_count,
                     "score":       chunk.get("score"),
-                    "drift_label": chunk.get("drift_label"),
+                    "raw_score":   chunk.get("raw_score"),
+                    "tempo_label": chunk.get("tempo_label"),
+                    "drift_label": drift_label,
+                    "drift_ms":    drift_ms,          # + 늦음 / - 빠름 / 0 정확
+                    "beat_ratio":  beat_ratio,        # beat_count / onset_count
                 },
             )
             reports.append(report)
@@ -1079,7 +1111,7 @@ def plot_beat_comparison(
 # ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     MIDI_PATH            = "twinkle2.mid"
-    AUDIO_PATH           = "reference.mp3"
+    AUDIO_PATH           = "performance2.mp4"
     SCORE_METADATA_PATH  = "score_metadata.json"   # None으로 바꾸면 beat_grid 방식으로 fallback
 
     agent = ViolinRhythmAgent(MIDI_PATH, score_metadata_path=SCORE_METADATA_PATH)
